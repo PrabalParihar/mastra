@@ -235,9 +235,14 @@ describe('removeSystemReminderTags', () => {
 
 describe('removeWorkingMemoryToolInvocationParts', () => {
   const reasoning = { type: 'reasoning' as const, reasoning: 'thinking', details: [] };
-  const call = (toolCallId: string, toolName: string): MastraMessagePart => ({
+  const call = (
+    toolCallId: string,
+    toolName: string,
+    providerMetadata?: MastraMessagePart['providerMetadata'],
+  ): MastraMessagePart => ({
     type: 'tool-invocation',
     toolInvocation: { state: 'result', toolCallId, toolName, args: {}, result: 'ok' },
+    ...(providerMetadata ? { providerMetadata } : {}),
   });
 
   it('drops a step left with only reasoning', () => {
@@ -316,6 +321,82 @@ describe('removeWorkingMemoryToolInvocationParts', () => {
   it('leaves state-signal setWorkingMemory calls alone', () => {
     const parts: MastraMessagePart[] = [{ type: 'step-start' }, reasoning, call('wm', 'setWorkingMemory')];
     expect(removeWorkingMemoryToolInvocationParts(parts)).toBe(parts);
+  });
+
+  // Gemini 3 signs only the first function call of a parallel step. Stripping that
+  // call drops the signature and a same-turn replay is rejected (#27231).
+  it('keeps a parallel step replayable when the signed call was updateWorkingMemory (#27231)', () => {
+    const signature = { google: { thoughtSignature: 'sig-wm' } };
+    expect(
+      removeWorkingMemoryToolInvocationParts([
+        { type: 'step-start' },
+        call('wm', 'updateWorkingMemory', signature),
+        call('other', 'suggestReplies'),
+      ]),
+    ).toEqual([{ type: 'step-start' }, call('other', 'suggestReplies', signature)]);
+  });
+
+  it('keeps a vertex thought signature on the first remaining tool call (#27231)', () => {
+    const signature = { vertex: { thoughtSignature: 'sig-vertex' } };
+    expect(
+      removeWorkingMemoryToolInvocationParts([
+        call('wm', 'updateWorkingMemory', signature),
+        call('other', 'suggestReplies'),
+      ]),
+    ).toEqual([call('other', 'suggestReplies', signature)]);
+  });
+
+  it('does not replace a thought signature the remaining tool call already has (#27231)', () => {
+    const kept = { google: { thoughtSignature: 'sig-kept' } };
+    expect(
+      removeWorkingMemoryToolInvocationParts([
+        call('wm', 'updateWorkingMemory', { google: { thoughtSignature: 'sig-wm' } }),
+        call('other', 'suggestReplies', kept),
+      ]),
+    ).toEqual([call('other', 'suggestReplies', kept)]);
+  });
+
+  it('adds the missing thought signature without taking the working-memory call metadata (#27231)', () => {
+    expect(
+      removeWorkingMemoryToolInvocationParts([
+        call('wm', 'updateWorkingMemory', {
+          google: { thoughtSignature: 'sig-wm' },
+          mastra: { modelOutput: { memory: 'secret' } },
+        }),
+        call('other', 'suggestReplies', {
+          google: { cachedContent: 'cache-1' },
+          mastra: { modelOutput: { replies: ['hike'] } },
+        }),
+      ]),
+    ).toEqual([
+      call('other', 'suggestReplies', {
+        google: { cachedContent: 'cache-1', thoughtSignature: 'sig-wm' },
+        mastra: { modelOutput: { replies: ['hike'] } },
+      }),
+    ]);
+  });
+
+  it('does not move a thought signature onto a tool call in a later step (#27231)', () => {
+    const next = call('other', 'suggestReplies');
+    expect(
+      removeWorkingMemoryToolInvocationParts([
+        { type: 'step-start' },
+        reasoning,
+        call('wm', 'updateWorkingMemory', { google: { thoughtSignature: 'sig-wm' } }),
+        { type: 'step-start' },
+        next,
+      ]),
+    ).toEqual([{ type: 'step-start' }, next]);
+  });
+
+  it('does not attach a thought signature when the step has no remaining tool call (#27231)', () => {
+    expect(
+      removeWorkingMemoryToolInvocationParts([
+        { type: 'step-start' },
+        { type: 'text', text: 'Saved.' },
+        call('wm', 'updateWorkingMemory', { google: { thoughtSignature: 'sig-wm' } }),
+      ]),
+    ).toEqual([{ type: 'step-start' }, { type: 'text', text: 'Saved.' }]);
   });
 });
 

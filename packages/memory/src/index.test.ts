@@ -429,6 +429,144 @@ describe('Memory', () => {
         expect(result).toBeNull();
       });
 
+      it('replays a parallel Gemini step with the thought signature on the remaining tool call (#27231)', async () => {
+        const store = new InMemoryStore();
+        const saveMemory = new Memory({ storage: store });
+        const thread = await saveMemory.createThread({ threadId: 'thread-1', resourceId: 'resource-1' });
+        const signature = { google: { thoughtSignature: 'sig-wm' } };
+        const assistant: MastraDBMessage = {
+          id: 'assistant-1',
+          role: 'assistant',
+          createdAt: new Date('2026-01-01T00:00:01Z'),
+          threadId: thread.id,
+          resourceId: 'resource-1',
+          content: {
+            format: 2,
+            parts: [
+              { type: 'step-start' },
+              {
+                type: 'tool-invocation',
+                toolInvocation: {
+                  state: 'result',
+                  toolCallId: 'wm-1',
+                  toolName: 'updateWorkingMemory',
+                  args: { memory: 'Sam likes hiking' },
+                  result: { ok: true },
+                },
+                providerMetadata: signature,
+              },
+              {
+                type: 'tool-invocation',
+                toolInvocation: {
+                  state: 'result',
+                  toolCallId: 'suggest-1',
+                  toolName: 'suggestReplies',
+                  args: { replies: ['Hike the ridge'] },
+                  result: { ok: true },
+                },
+              },
+            ],
+            toolInvocations: [
+              {
+                state: 'result',
+                toolCallId: 'wm-1',
+                toolName: 'updateWorkingMemory',
+                args: { memory: 'Sam likes hiking' },
+                result: { ok: true },
+              },
+              {
+                state: 'result',
+                toolCallId: 'suggest-1',
+                toolName: 'suggestReplies',
+                args: { replies: ['Hike the ridge'] },
+                result: { ok: true },
+              },
+            ],
+          },
+        };
+
+        await saveMemory.saveMessages({
+          messages: [
+            {
+              id: 'user-1',
+              role: 'user',
+              createdAt: new Date('2026-01-01T00:00:00Z'),
+              threadId: thread.id,
+              resourceId: 'resource-1',
+              content: { format: 2, parts: [{ type: 'text', text: 'My name is Sam and I like hiking.' }] },
+            },
+            assistant,
+          ],
+        });
+
+        const { messages } = await saveMemory.recall({ threadId: thread.id, resourceId: 'resource-1' });
+        const recalled = messages.find(message => message.role === 'assistant');
+        const storedPart = recalled?.content.parts.find(part => part.type === 'tool-invocation');
+        expect(storedPart?.type === 'tool-invocation' && storedPart.toolInvocation.toolName).toBe('suggestReplies');
+        expect(storedPart?.type === 'tool-invocation' && storedPart.providerMetadata).toMatchObject(signature);
+        expect(recalled?.content.toolInvocations?.map(invocation => invocation.toolName)).toEqual(['suggestReplies']);
+
+        const replay = new MessageList().add(messages, 'memory').get.all.aiV5.prompt();
+        const toolCalls = replay.flatMap(message =>
+          message.role === 'assistant' && Array.isArray(message.content)
+            ? message.content.filter(part => part.type === 'tool-call')
+            : [],
+        );
+        expect(toolCalls.map(part => part.toolName)).toEqual(['suggestReplies']);
+        expect(toolCalls[0] && 'providerOptions' in toolCalls[0] && toolCalls[0].providerOptions).toMatchObject(
+          signature,
+        );
+        expect(JSON.stringify(replay)).not.toContain('updateWorkingMemory');
+      });
+
+      it('keeps a vertex thought signature on the first remaining tool call (#27231)', () => {
+        const signature = { vertex: { thoughtSignature: 'sig-vertex' } };
+        const result = memory.testUpdateMessageToHideWorkingMemoryV2(
+          assistantMessage([
+            { type: 'step-start' },
+            { ...toolInvocation('wm-1', 'updateWorkingMemory'), providerMetadata: signature },
+            toolInvocation('suggest-1', 'suggestReplies'),
+          ]),
+        );
+
+        const storedPart = result?.content.parts.find(part => part.type === 'tool-invocation');
+        expect(storedPart).toEqual({ ...toolInvocation('suggest-1', 'suggestReplies'), providerMetadata: signature });
+      });
+
+      it('does not replace a thought signature the remaining tool call already has (#27231)', () => {
+        const kept = { google: { thoughtSignature: 'sig-kept' } };
+        const result = memory.testUpdateMessageToHideWorkingMemoryV2(
+          assistantMessage([
+            { type: 'step-start' },
+            {
+              ...toolInvocation('wm-1', 'updateWorkingMemory'),
+              providerMetadata: { google: { thoughtSignature: 'sig-wm' } },
+            },
+            { ...toolInvocation('suggest-1', 'suggestReplies'), providerMetadata: kept },
+          ]),
+        );
+
+        const storedPart = result?.content.parts.find(part => part.type === 'tool-invocation');
+        expect(storedPart).toEqual({ ...toolInvocation('suggest-1', 'suggestReplies'), providerMetadata: kept });
+      });
+
+      it('does not move a thought signature onto a tool call in a later step (#27231)', () => {
+        const result = memory.testUpdateMessageToHideWorkingMemoryV2(
+          assistantMessage([
+            { type: 'step-start' },
+            reasoning('SIG_A'),
+            {
+              ...toolInvocation('wm-1', 'updateWorkingMemory'),
+              providerMetadata: { vertex: { thoughtSignature: 'sig-vertex' } },
+            },
+            { type: 'step-start' },
+            toolInvocation('suggest-1', 'suggestReplies'),
+          ]),
+        );
+
+        expect(result?.content.parts).toEqual([{ type: 'step-start' }, toolInvocation('suggest-1', 'suggestReplies')]);
+      });
+
       it('saved history replays without a reasoning-only assistant message next to another assistant message', async () => {
         const store = new InMemoryStore();
         const saveMemory = new Memory({ storage: store });

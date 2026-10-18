@@ -111,6 +111,61 @@ export function extractWorkingMemoryContent(text: string): string | null {
   return text.substring(contentStart, end);
 }
 
+function readThoughtSignature(metadata: MastraMessagePart['providerMetadata'], provider: string): string | undefined {
+  const namespace = metadata?.[provider];
+  if (!namespace || typeof namespace !== 'object') return undefined;
+  const signature = namespace.thoughtSignature;
+  return typeof signature === 'string' && signature.length > 0 ? signature : undefined;
+}
+
+/**
+ * Gemini 3 signs only the first function call of a parallel step. When that call is
+ * `updateWorkingMemory`, stripping it leaves the rest of the step unsigned and a
+ * same-turn replay is rejected (#27231). Copy the stripped signature onto the first
+ * tool call that remains in the same step, and leave a signature that call already has.
+ * The legacy `toolInvocations` array has no provider metadata, so there is nothing
+ * to move there.
+ */
+function preserveStrippedThoughtSignature(
+  remaining: MastraMessagePart[],
+  removed: MastraMessagePart[],
+): MastraMessagePart[] {
+  const providers: string[] = [];
+  for (const part of removed) {
+    if (!part.providerMetadata) continue;
+    for (const provider of Object.keys(part.providerMetadata)) {
+      if (!providers.includes(provider) && readThoughtSignature(part.providerMetadata, provider)) {
+        providers.push(provider);
+      }
+    }
+  }
+  if (providers.length === 0) return remaining;
+
+  const targetIndex = remaining.findIndex(part => part?.type === 'tool-invocation');
+  if (targetIndex < 0) return remaining;
+
+  const target = remaining[targetIndex]!;
+  const nextMetadata: NonNullable<MastraMessagePart['providerMetadata']> = { ...(target.providerMetadata ?? {}) };
+  let moved = false;
+  for (const provider of providers) {
+    if (readThoughtSignature(nextMetadata, provider)) continue;
+    const signature = removed
+      .map(part => readThoughtSignature(part.providerMetadata, provider))
+      .find((value): value is string => typeof value === 'string');
+    if (!signature) continue;
+    nextMetadata[provider] = {
+      ...(nextMetadata[provider] ?? {}),
+      thoughtSignature: signature,
+    };
+    moved = true;
+  }
+  if (!moved) return remaining;
+
+  const next = remaining.slice();
+  next[targetIndex] = { ...target, providerMetadata: nextMetadata };
+  return next;
+}
+
 /**
  * Removes `updateWorkingMemory` tool invocations from stored message parts, one step
  * at a time. A step starts at a `step-start` part, or where a tool part is followed by
@@ -118,7 +173,8 @@ export function extractWorkingMemoryContent(text: string): string | null {
  * A step whose tool calls were all working-memory calls loses its tool-call/tool-result
  * boundary once they are removed. If only reasoning is left, the whole step is dropped:
  * replaying that signed reasoning merges it into the next step's assistant message,
- * which providers such as Anthropic reject (see #22798).
+ * which providers such as Anthropic reject (see #22798). A thought signature on a
+ * stripped call is copied onto the first remaining tool call in that step (#27231).
  */
 export function removeWorkingMemoryToolInvocationParts(parts: MastraMessagePart[]): MastraMessagePart[] {
   const isWorkingMemoryCall = (part: MastraMessagePart) =>
@@ -137,6 +193,7 @@ export function removeWorkingMemoryToolInvocationParts(parts: MastraMessagePart[
 
   return steps.flatMap(step => {
     if (!step.some(isWorkingMemoryCall)) return step;
+    const removed = step.filter(isWorkingMemoryCall);
     const remaining = step.filter(part => !isWorkingMemoryCall(part));
     const onlyReasoningLeft = remaining.every(
       part =>
@@ -144,13 +201,14 @@ export function removeWorkingMemoryToolInvocationParts(parts: MastraMessagePart[
         part?.type === 'reasoning' ||
         (part?.type === 'text' && !removeWorkingMemoryTags(part.text ?? '').trim()),
     );
-    return onlyReasoningLeft ? [] : remaining;
+    return onlyReasoningLeft ? [] : preserveStrippedThoughtSignature(remaining, removed);
   });
 }
 
 /**
  * Removes `updateWorkingMemory` entries from the legacy `toolInvocations` array so
- * prompt conversion cannot re-add a stripped working-memory call.
+ * prompt conversion cannot re-add a stripped working-memory call. Entries in this
+ * array have no provider metadata; thought signatures live on the tool-invocation part.
  */
 export function removeWorkingMemoryToolInvocations(
   toolInvocations: MastraMessageContentV2['toolInvocations'],
