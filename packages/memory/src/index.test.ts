@@ -429,6 +429,98 @@ describe('Memory', () => {
         expect(result).toBeNull();
       });
 
+      describe('Gemini thought signatures on parallel working-memory steps (#27231)', () => {
+        const signedWorkingMemory = {
+          type: 'tool-invocation' as const,
+          toolInvocation: {
+            state: 'result' as const,
+            toolCallId: 'wm-1',
+            toolName: 'updateWorkingMemory',
+            args: { memory: 'Sam likes hiking' },
+            result: { success: true },
+          },
+          providerMetadata: { google: { thoughtSignature: 'sig-wm' } },
+        };
+
+        it('keeps the removed working-memory signature on the first remaining tool call', () => {
+          const result = memory.testUpdateMessageToHideWorkingMemoryV2(
+            assistantMessage([
+              { type: 'step-start' },
+              signedWorkingMemory,
+              toolInvocation('replies', 'suggestReplies'),
+            ]),
+          );
+
+          expect(result?.content.parts).toEqual([
+            { type: 'step-start' },
+            {
+              ...toolInvocation('replies', 'suggestReplies'),
+              providerMetadata: { google: { thoughtSignature: 'sig-wm' } },
+            },
+          ]);
+          expect(result?.content.toolInvocations?.map(invocation => invocation.toolName)).toEqual(['suggestReplies']);
+
+          const list = new MessageList({ threadId: 'thread-1', resourceId: 'resource-1' });
+          list.add(result!, 'memory');
+          const toolCalls = list.get.all.aiV5
+            .model()
+            .flatMap(message =>
+              Array.isArray(message.content) ? message.content.filter(part => part.type === 'tool-call') : [],
+            );
+          expect(toolCalls).toEqual([
+            expect.objectContaining({
+              type: 'tool-call',
+              toolName: 'suggestReplies',
+              providerOptions: expect.objectContaining({
+                google: expect.objectContaining({ thoughtSignature: 'sig-wm' }),
+              }),
+            }),
+          ]);
+        });
+
+        it('does not overwrite a thought signature the remaining call already has', () => {
+          const result = memory.testUpdateMessageToHideWorkingMemoryV2(
+            assistantMessage([
+              { type: 'step-start' },
+              signedWorkingMemory,
+              {
+                ...toolInvocation('replies', 'suggestReplies'),
+                providerMetadata: { openai: { itemId: 'fc_1' }, google: { thoughtSignature: 'sig-keep' } },
+              },
+            ]),
+          );
+
+          const kept = result?.content.parts.find(part => part.type === 'tool-invocation');
+          expect(kept).toMatchObject({
+            toolInvocation: { toolName: 'suggestReplies' },
+            providerMetadata: { openai: { itemId: 'fc_1' }, google: { thoughtSignature: 'sig-keep' } },
+          });
+        });
+
+        it('leaves real text in place when the step has no tool call left', () => {
+          const result = memory.testUpdateMessageToHideWorkingMemoryV2(
+            assistantMessage([{ type: 'step-start' }, { type: 'text', text: 'Saved that.' }, signedWorkingMemory]),
+          );
+
+          expect(result?.content.parts).toEqual([{ type: 'step-start' }, { type: 'text', text: 'Saved that.' }]);
+          expect(JSON.stringify(result?.content.parts)).not.toContain('sig-wm');
+        });
+
+        it('drops a reasoning-only step without moving its signature onto the next step', () => {
+          const result = memory.testUpdateMessageToHideWorkingMemoryV2(
+            assistantMessage([
+              { type: 'step-start' },
+              reasoning('SIG_A'),
+              signedWorkingMemory,
+              { type: 'step-start' },
+              toolInvocation('call-1', 'lookupWeather'),
+            ]),
+          );
+
+          expect(result?.content.parts).toEqual([{ type: 'step-start' }, toolInvocation('call-1', 'lookupWeather')]);
+        });
+      });
+
       it('saved history replays without a reasoning-only assistant message next to another assistant message', async () => {
         const store = new InMemoryStore();
         const saveMemory = new Memory({ storage: store });

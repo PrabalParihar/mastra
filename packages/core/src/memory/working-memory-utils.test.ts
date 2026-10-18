@@ -319,6 +319,125 @@ describe('removeWorkingMemoryToolInvocationParts', () => {
   });
 });
 
+describe('Gemini thought signatures on parallel working-memory steps (#27231)', () => {
+  const call = (
+    toolCallId: string,
+    toolName: string,
+    providerMetadata?: Extract<MastraMessagePart, { type: 'tool-invocation' }>['providerMetadata'],
+  ): MastraMessagePart => ({
+    type: 'tool-invocation',
+    toolInvocation: { state: 'result', toolCallId, toolName, args: {}, result: 'ok' },
+    ...(providerMetadata ? { providerMetadata } : {}),
+  });
+  const signed = (toolCallId: string, toolName: string, thoughtSignature: string): MastraMessagePart =>
+    call(toolCallId, toolName, { google: { thoughtSignature } });
+
+  it('keeps the removed working-memory signature on the first remaining tool call', () => {
+    // Gemini 3 signs only the first function call. When that call is updateWorkingMemory,
+    // the stored step must still carry the signature or a same-turn replay is rejected.
+    const result = removeWorkingMemoryToolInvocationParts([
+      { type: 'step-start' },
+      signed('wm', 'updateWorkingMemory', 'sig-wm'),
+      call('replies', 'suggestReplies'),
+    ]);
+
+    expect(result).toEqual([
+      { type: 'step-start' },
+      call('replies', 'suggestReplies', { google: { thoughtSignature: 'sig-wm' } }),
+    ]);
+  });
+
+  it('does not overwrite a thought signature the remaining call already has', () => {
+    const survivor = call('replies', 'suggestReplies', {
+      openai: { itemId: 'fc_1' },
+      google: { thoughtSignature: 'sig-keep' },
+    });
+
+    expect(
+      removeWorkingMemoryToolInvocationParts([
+        { type: 'step-start' },
+        signed('wm', 'updateWorkingMemory', 'sig-wm'),
+        survivor,
+      ]),
+    ).toEqual([{ type: 'step-start' }, survivor]);
+  });
+
+  it('adds the signature without dropping metadata already on the remaining call', () => {
+    expect(
+      removeWorkingMemoryToolInvocationParts([
+        { type: 'step-start' },
+        call('wm', 'updateWorkingMemory', { google: { thoughtSignature: 'sig-wm' }, mastra: { source: 'wm' } }),
+        call('replies', 'suggestReplies', { openai: { itemId: 'fc_1' }, google: { cachedContent: 'cache-1' } }),
+      ]),
+    ).toEqual([
+      { type: 'step-start' },
+      call('replies', 'suggestReplies', {
+        openai: { itemId: 'fc_1' },
+        google: { cachedContent: 'cache-1', thoughtSignature: 'sig-wm' },
+      }),
+    ]);
+  });
+
+  it('leaves real text in place when the step has no tool call left', () => {
+    expect(
+      removeWorkingMemoryToolInvocationParts([
+        { type: 'step-start' },
+        { type: 'text', text: 'Saved that.' },
+        signed('wm', 'updateWorkingMemory', 'sig-wm'),
+      ]),
+    ).toEqual([{ type: 'step-start' }, { type: 'text', text: 'Saved that.' }]);
+  });
+
+  it('does not attach the signature to text that follows the removed call', () => {
+    // A non-tool part after a tool call starts the next step, so the working-memory
+    // step is dropped and the text is kept unsigned.
+    expect(
+      removeWorkingMemoryToolInvocationParts([
+        { type: 'step-start' },
+        signed('wm', 'updateWorkingMemory', 'sig-wm'),
+        { type: 'text', text: 'Saved that.' },
+      ]),
+    ).toEqual([{ type: 'text', text: 'Saved that.' }]);
+  });
+
+  it('drops a reasoning-only step without moving its signature onto the next step', () => {
+    const next = call('weather', 'lookupWeather');
+    const result = removeWorkingMemoryToolInvocationParts([
+      { type: 'step-start' },
+      { type: 'reasoning', reasoning: 'thinking', details: [] },
+      signed('wm', 'updateWorkingMemory', 'sig-dropped'),
+      { type: 'step-start' },
+      next,
+    ]);
+
+    expect(result).toEqual([{ type: 'step-start' }, next]);
+    expect(result[1]).toBe(next);
+  });
+
+  it('does not invent a signature when the removed call has none', () => {
+    const survivor = call('replies', 'suggestReplies');
+    const result = removeWorkingMemoryToolInvocationParts([
+      { type: 'step-start' },
+      call('wm', 'updateWorkingMemory'),
+      survivor,
+    ]);
+
+    expect(result).toEqual([{ type: 'step-start' }, survivor]);
+    expect(result[1]).toBe(survivor);
+  });
+
+  it('does not mutate the input parts', () => {
+    const workingMemory = signed('wm', 'updateWorkingMemory', 'sig-wm');
+    const replies = call('replies', 'suggestReplies', { openai: { itemId: 'fc_1' } });
+    const parts: MastraMessagePart[] = [{ type: 'step-start' }, workingMemory, replies];
+
+    removeWorkingMemoryToolInvocationParts(parts);
+
+    expect(parts).toEqual([{ type: 'step-start' }, workingMemory, replies]);
+    expect(replies).toEqual(call('replies', 'suggestReplies', { openai: { itemId: 'fc_1' } }));
+  });
+});
+
 describe('removeWorkingMemoryToolInvocations', () => {
   const invocation = (toolName: string) => ({
     state: 'result' as const,

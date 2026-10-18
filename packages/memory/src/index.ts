@@ -240,6 +240,62 @@ type MastraMessagePart = MastraDBMessage['content']['parts'][number];
 const UPDATE_WORKING_MEMORY_TOOL_NAME = 'updateWorkingMemory';
 
 /**
+ * Gemini 3 signs only the first function call of a parallel step
+ * (`providerMetadata.google.thoughtSignature`). A non-empty string is a signature.
+ * Keep in sync with packages/core/src/memory/working-memory-utils.ts.
+ */
+function googleThoughtSignature(part: MastraMessagePart | undefined): string | undefined {
+  if (part?.type !== 'tool-invocation') return undefined;
+  const google = part.providerMetadata?.google;
+  if (!google || typeof google !== 'object') return undefined;
+  const signature = google.thoughtSignature;
+  return typeof signature === 'string' && signature.length > 0 ? signature : undefined;
+}
+
+function withGoogleThoughtSignature(part: MastraMessagePart, signature: string): MastraMessagePart {
+  if (part.type !== 'tool-invocation') return part;
+  const google = part.providerMetadata?.google;
+  const googleMetadata = google && typeof google === 'object' ? google : {};
+  return {
+    ...part,
+    providerMetadata: {
+      ...part.providerMetadata,
+      google: {
+        ...googleMetadata,
+        thoughtSignature: signature,
+      },
+    },
+  };
+}
+
+/**
+ * Keep a stripped working-memory call's Gemini thought signature on the first tool
+ * call that is still in the step. A signature already on that call stays put. When
+ * the step has no tool call left, Gemini has no function call to validate, so the
+ * signature is not copied onto text or reasoning.
+ */
+function preserveStrippedThoughtSignature(
+  removed: MastraMessagePart[],
+  remaining: MastraMessagePart[],
+): MastraMessagePart[] {
+  const targetIndex = remaining.findIndex(part => part?.type === 'tool-invocation');
+  const target = remaining[targetIndex];
+  if (!target) return remaining;
+  if (googleThoughtSignature(target)) return remaining;
+
+  let signature: string | undefined;
+  for (const part of removed) {
+    signature = googleThoughtSignature(part);
+    if (signature) break;
+  }
+  if (!signature) return remaining;
+
+  const next = remaining.slice();
+  next[targetIndex] = withGoogleThoughtSignature(target, signature);
+  return next;
+}
+
+/**
  * Removes `updateWorkingMemory` tool invocations from stored message parts, one step
  * at a time. A step starts at a `step-start` part, or where a tool part is followed by
  * a non-tool part (the same boundary prompt conversion uses when markers are missing).
@@ -247,6 +303,10 @@ const UPDATE_WORKING_MEMORY_TOOL_NAME = 'updateWorkingMemory';
  * boundary once they are removed. If only reasoning is left, the whole step is dropped:
  * replaying that signed reasoning merges it into the next step's assistant message,
  * which providers such as Anthropic reject (see #22798).
+ *
+ * Gemini 3 attaches its thought signature only to the first function call of a parallel
+ * step. When that call is `updateWorkingMemory`, the signature moves to the first
+ * remaining tool call so a same-turn replay is still accepted (see #27231).
  */
 function removeWorkingMemoryToolInvocationParts(parts: MastraMessagePart[]): MastraMessagePart[] {
   const isWorkingMemoryCall = (part: MastraMessagePart) =>
@@ -265,6 +325,7 @@ function removeWorkingMemoryToolInvocationParts(parts: MastraMessagePart[]): Mas
 
   return steps.flatMap(step => {
     if (!step.some(isWorkingMemoryCall)) return step;
+    const removed = step.filter(isWorkingMemoryCall);
     const remaining = step.filter(part => !isWorkingMemoryCall(part));
     const onlyReasoningLeft = remaining.every(
       part =>
@@ -272,13 +333,16 @@ function removeWorkingMemoryToolInvocationParts(parts: MastraMessagePart[]): Mas
         part?.type === 'reasoning' ||
         (part?.type === 'text' && !removeWorkingMemoryTags(part.text ?? '').trim()),
     );
-    return onlyReasoningLeft ? [] : remaining;
+    if (onlyReasoningLeft) return [];
+    return preserveStrippedThoughtSignature(removed, remaining);
   });
 }
 
 /**
  * Removes `updateWorkingMemory` entries from the legacy `toolInvocations` array so
  * prompt conversion cannot re-add a stripped working-memory call.
+ * Those entries have no per-call provider metadata. Gemini thought signatures live on
+ * the tool-invocation part and are kept by `removeWorkingMemoryToolInvocationParts`.
  */
 function removeWorkingMemoryToolInvocations(
   toolInvocations: MastraDBMessage['content']['toolInvocations'],
